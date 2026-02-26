@@ -12,7 +12,7 @@ class WindowsInApple:
         
         self.root.tk.call('tk', 'unsupported', 'MacWindowStyle', 'style', self.root._w, 'help', 'none')
         
-        self.canvas = tk.Canvas(self.root, highlightthickness=0, bg='systemTransparent', bd=0)
+        self.canvas = tk.Canvas(self.root, highlightthickness=0, bd=0, insertwidth=0, bg='systemTransparent', bd=0)
         self.canvas.pack(fill="both", expand=True)
         self.run()
 
@@ -32,13 +32,13 @@ class WindowsInApple:
                     x, y, w, h = bounds['X'], bounds['Y'], bounds['Width'], bounds['Height']
                     
                     if "Google Chrome" in owner:
-                        self.canvas.create_rectangle(x + w - 150, y + 5, x + w - 5, y + 35, 
+                        self.canvas.create_rectangle(x - 20, y - 20, x + w + 20, y + 50, 
                                                    fill=self.chrome_gray, outline=self.chrome_gray)
                         
 
             self.root.update_idletasks()
             self.root.update()
-            time.sleep(0.008)
+            self.root.update(); self.root.update(); time.sleep(0.008)
 
 if __name__ == "__main__":
     WindowsInApple()
