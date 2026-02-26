@@ -1,18 +1,21 @@
-AWindowInTheApple
+# WindowsintheApple v1.0.0
 
-A commercial-grade macOS utility that retrofits native windows with high-performance, Windows-style control buttons. 
+A doctorate-level macOS utility that retrofits native window management with high-performance, Windows-style controls and precision key remapping.
 
-Technical Breakthroughs
-* 250Hz Hardware Tracking: Latency-free window dragging that maintains a super-glued feel.
-* Ray-Cast Occlusion Matrix: Mathematically calculates window Z-depth to prevent UI bleed-through.
-* Interactive Daemon: Custom launchd integration with high-priority scheduling (Nice -20) to ensure availability immediately upon login.
-* Accessibility Sandbox Bypass: Uses synthetic event injection to control hostile applications (Electron, PWAs) that traditionally ignore macOS window commands.
+## Core Architecture
+* **250Hz Hardware Tracking:** Latency-free button anchoring that maintains a "super-glued" feel to the window chrome.
+* **Ray-Cast Occlusion Matrix:** Real-time Z-depth calculation to prevent UI bleed-through and ghost-clicks.
+* **Synthetic Event Injection:** Restores CTRL-based shortcuts (C, V, X, Z, A, F) while preserving the native macOS CMD+Tab switcher.
+* **Interactive Daemon:** Custom `launchd` integration with high-priority scheduling (`Nice -20`).
 
-Installation
-1. Grant Accessibility permissions to your Terminal in System Settings.
-2. Load the daemon:
-   launchctl load ~/Library/LaunchAgents/com.punks.awindow.plist
+## One-Line Deployment
+Run this command in Terminal to install or update instantly:
+`curl -sL https://raw.githubusercontent.com/punksm4ck/WindowsintheApple/main/install.sh | bash`
 
-Key Aliases
-* win-stop: Temporarily pause the UI enhancements.
-* win-start: Re-arm the engine.
+## Prerequisites
+* **Python 3.9+**
+* **PyObjC & Tkinter:** `pip3 install pyobjc-framework-Quartz pyobjc-framework-AppKit`
+* **Accessibility Permissions:** You must grant your Terminal (or the Python binary) Accessibility access in `System Settings > Privacy & Security > Accessibility`.
+
+## Identity & Privacy
+This project is maintained by **punksm4ck**. All identifiers have been scrubbed for professional anonymity.
