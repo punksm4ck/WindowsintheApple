@@ -1,61 +1,54 @@
-import Quartz
-import AppKit
-from AppKit import NSWorkspace, NSApplicationActivateIgnoringOtherApps
+import tkinter as tk
+from Quartz import CGWindowListCopyWindowInfo, kCGWindowListOptionOnScreenOnly, kCGNullWindowID
 import time
-import sys
 
-class PunksEngine:
+class WindowsInApple:
     def __init__(self):
-        self.last_key_time = 0
-        self.palm_threshold = 0.2
-
-    def event_callback(self, proxy, event_type, event, refcon):
-        current_time = time.time()
+        self.root = tk.Tk()
+        self.root.overrideredirect(True)
+        self.root.attributes("-topmost", True)
+        self.root.attributes("-transparent", True)
+        # Match Chrome Dark Mode exactly
+        self.chrome_gray = "#35363a"
+        self.root.config(bg='systemTransparent')
         
-        if event_type in [Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp]:
-            if (current_time - self.last_key_time) < self.palm_threshold:
-                return None
+        # Absolute click-through for 1:1 terminal responsiveness
+        self.root.tk.call('tk', 'unsupported', 'MacWindowStyle', 'style', self.root._w, 'help', 'none')
+        
+        self.canvas = tk.Canvas(self.root, highlightthickness=0, bg='systemTransparent', bd=0)
+        self.canvas.pack(fill="both", expand=True)
+        self.run()
 
-        if event_type == Quartz.kCGEventKeyDown:
-            self.last_key_time = current_time
-            flags = Quartz.CGEventGetFlags(event)
-            keycode = Quartz.CGEventGetIntegerPropertyValue(event, Quartz.kCGKeyboardEventKeycode)
+    def run(self):
+        while True:
+            self.canvas.delete("all")
+            windows = CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly, kCGNullWindowID)
+            for window in windows:
+                if window.get("kCGWindowLayer", 0) != 0 or not window.get("kCGWindowIsOnscreen"):
+                    continue
+                
+                name = window.get("kCGWindowName", "")
+                owner = window.get("kCGWindowOwnerName", "")
+                bounds = window.get("kCGWindowBounds")
+                
+                if bounds:
+                    x, y, w, h = bounds['X'], bounds['Y'], bounds['Width'], bounds['Height']
+                    
+                    # Target Chrome Specifically to mask the AI Tag
+                    if "Google Chrome" in owner:
+                        # Draw a masking rectangle over the top-right AI tag area
+                        # Adjusted width (120px) to fully cover "AI Mode"
+                        self.canvas.create_rectangle(x + w - 150, y + 5, x + w - 5, y + 35, 
+                                                   fill=self.chrome_gray, outline=self.chrome_gray)
+                        
+                        # Windows-style buttons on top of the mask
+                        self.canvas.create_oval(x + w - 45, y + 10, x + w - 25, y + 30, fill="#ff5f57") # Close
+                        self.canvas.create_oval(x + w - 75, y + 10, x + w - 55, y + 30, fill="#ffbd2e") # Max
+                        self.canvas.create_oval(x + w - 105, y + 10, x + w - 85, y + 30, fill="#28c940") # Min
 
-            if keycode in [8, 9, 7, 6, 0] and (flags & Quartz.kCGEventFlagMaskControl):
-                flags &= ~Quartz.kCGEventFlagMaskControl
-                flags |= Quartz.kCGEventFlagMaskCommand
-                Quartz.CGEventSetFlags(event, flags)
-
-            if keycode == 48 and (flags & Quartz.kCGEventFlagMaskCommand):
-                ws = NSWorkspace.sharedWorkspace()
-                app = ws.frontmostApplication()
-                if app:
-                    app.activateWithOptions_(NSApplicationActivateIgnoringOtherApps)
-
-        return event
-
-def run_tap():
-    engine = PunksEngine()
-    mask = (Quartz.CGEventMaskBit(Quartz.kCGEventKeyDown) |
-            Quartz.CGEventMaskBit(Quartz.kCGEventLeftMouseDown) |
-            Quartz.CGEventMaskBit(Quartz.kCGEventLeftMouseUp))
-            
-    event_tap = Quartz.CGEventTapCreate(
-        Quartz.kCGSessionEventTap,
-        Quartz.kCGHeadInsertEventTap,
-        Quartz.kCGEventTapOptionDefault,
-        mask,
-        engine.event_callback,
-        None
-    )
-    
-    if not event_tap:
-        sys.exit(1)
-
-    run_loop_source = Quartz.CFMachPortCreateRunLoopSource(None, event_tap, 0)
-    Quartz.CFRunLoopAddSource(Quartz.CFRunLoopGetCurrent(), run_loop_source, Quartz.kCFRunLoopCommonModes)
-    Quartz.CGEventTapEnable(event_tap, True)
-    Quartz.CFRunLoopRun()
+            self.root.update_idletasks()
+            self.root.update()
+            time.sleep(0.008)
 
 if __name__ == "__main__":
-    run_tap()
+    WindowsInApple()
