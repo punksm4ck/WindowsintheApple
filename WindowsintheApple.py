@@ -32,13 +32,13 @@ class WindowsInApple:
                     x, y, w, h = bounds['X'], bounds['Y'], bounds['Width'], bounds['Height']
                     
                     if "Google Chrome" in owner:
-                        self.canvas.create_rectangle(x - 20, y - 20, x + w + 20, y + 50, 
+                        self.canvas.create_rectangle(x - 20, y - 20, x + w + 20, y + 60, 
                                                    fill=self.chrome_gray, outline=self.chrome_gray)
                         
 
             self.root.update_idletasks()
-            self.root.update()
-            self.root.update(); self.root.update(); time.sleep(0.008)
+            self.root.update_idletasks(); self.root.update()
+            self.root.update_idletasks(); self.root.update(); self.root.update_idletasks(); self.root.update(); time.sleep(0.008)
 
 if __name__ == "__main__":
     WindowsInApple()
