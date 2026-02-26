@@ -1,46 +1,37 @@
-import tkinter as tk
-from Quartz import CGWindowListCopyWindowInfo, kCGWindowListOptionOnScreenOnly, kCGNullWindowID
-import AppKit
+import Quartz
+from AppKit import NSWorkspace
 import time
 
-class WindowsInApple:
-    def __init__(self):
-        self.root = tk.Tk()
-        self.root.overrideredirect(True)
-        self.root.attributes("-topmost", True)
-        self.root.attributes("-transparent", True)
-        self.root.config(bg='systemTransparent')
-        # This line is the key: it ignores ALL mouse events on the window itself
-        self.root.tk.call('tk', 'unsupported', 'MacWindowStyle', 'style', self.root._w, 'help', 'none')
+def event_callback(proxy, event_type, event, refcon):
+    flags = Quartz.CGEventGetFlags(event)
+    keycode = Quartz.CGEventGetIntegerPropertyValue(event, Quartz.kCGKeyboardEventKeycode)
+    
+    # Surgical Remapping: CTRL (0x3b) to CMD (0x3a) for standard shortcuts
+    # 0x08=C, 0x09=V, 0x07=X, 0x06=Z, 0x00=A
+    if keycode in [8, 9, 7, 6, 0] and (flags & Quartz.kCGEventFlagMaskControl):
+        flags &= ~Quartz.kCGEventFlagMaskControl
+        flags |= Quartz.kCGEventFlagMaskCommand
+        Quartz.CGEventSetFlags(event, flags)
         
-        self.canvas = tk.Canvas(self.root, highlightthickness=0, bg='systemTransparent', bd=0)
-        self.canvas.pack(fill="both", expand=True)
-        
-        self.run()
+    return event
 
-    def get_windows(self):
-        # Only grab windows that are actually on screen
-        options = kCGWindowListOptionOnScreenOnly
-        return CGWindowListCopyWindowInfo(options, kCGNullWindowID)
+def run_tap():
+    event_tap = Quartz.CGEventTapCreate(
+        Quartz.kCGSessionEventTap,
+        Quartz.kCGHeadInsertEventTap,
+        Quartz.kCGEventTapOptionDefault,
+        Quartz.kCGEventMaskForAllEvents,
+        event_callback,
+        None
+    )
+    
+    if not event_tap:
+        return
 
-    def run(self):
-        while True:
-            self.canvas.delete("all")
-            windows = self.get_windows()
-            for window in windows:
-                # Visibility and Ghosting Guard
-                if not window.get("kCGWindowIsOnscreen") or window.get("kCGWindowLayer", 0) != 0:
-                    continue
-                
-                bounds = window.get("kCGWindowBounds")
-                if bounds:
-                    # Draw your buttons here based on bounds
-                    # (Simplified for logic verification)
-                    pass
-            
-            self.root.update_idletasks()
-            self.root.update()
-            time.sleep(0.008) # 125Hz - Perfect balance
+    run_loop_source = Quartz.CFMachPortCreateRunLoopSource(None, event_tap, 0)
+    Quartz.CFRunLoopAddSource(Quartz.CFRunLoopGetCurrent(), run_loop_source, Quartz.kCFRunLoopCommonModes)
+    Quartz.CGEventTapEnable(event_tap, True)
+    Quartz.CFRunLoopRun()
 
 if __name__ == "__main__":
-    WindowsInApple()
+    run_tap()
