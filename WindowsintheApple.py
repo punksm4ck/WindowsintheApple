@@ -52,19 +52,16 @@ class WindowsInApple:
         self.canvas = tk.Canvas(self.root, highlightthickness=0, bd=0, bg='systemTransparent')
         self.canvas.pack(fill="both", expand=True)
         self.chrome_bg = "#1f1f1f"
-        self.last_state = None
+        self.last_state = ""
         self.update_loop()
         self.root.mainloop()
 
     def update_loop(self):
         try:
             windows = Quartz.CGWindowListCopyWindowInfo(Quartz.kCGWindowListOptionOnScreenOnly, Quartz.kCGNullWindowID)
-            current_state = []
-            for w in windows:
-                if w.get("kCGWindowLayer", 0) == 0 and w.get("kCGWindowIsOnscreen"):
-                    current_state.append((w.get("kCGWindowNumber"), str(w.get("kCGWindowBounds"))))
+            state_str = "".join([f"{w.get('kCGWindowNumber')}{w.get('kCGWindowBounds')}" for w in windows if w.get('kCGWindowLayer') == 0])
             
-            if current_state != self.last_state:
+            if state_str != self.last_state:
                 self.canvas.delete("all")
                 for w_info in windows:
                     if w_info.get("kCGWindowLayer", 0) != 0: continue
@@ -79,9 +76,9 @@ class WindowsInApple:
                             self.canvas.create_oval(rx + 44, ry, rx + 58, ry + 14, fill="#ff5f57", outline="#cf443e")
                             self.canvas.create_oval(rx + 22, ry, rx + 36, ry + 14, fill="#ffbd2e", outline="#cfa023")
                             self.canvas.create_oval(rx, ry, rx + 14, ry + 14, fill="#28c940", outline="#1aab29")
-                self.last_state = current_state
+                self.last_state = state_str
         except: pass
-        self.root.after(200, self.update_loop)
+        self.root.after(300, self.update_loop)
 
 if __name__ == "__main__":
     t = threading.Thread(target=run_tap, daemon=True)
