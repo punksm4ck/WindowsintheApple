@@ -1,44 +1,85 @@
 import tkinter as tk
-from Quartz import CGWindowListCopyWindowInfo, kCGWindowListOptionOnScreenOnly, kCGNullWindowID
+import Quartz
+import AppKit
+import threading
 import time
+import sys
+
+class PunksEngine:
+    def __init__(self):
+        self.last_key_time = 0
+        self.palm_threshold = 0.2
+    def event_callback(self, proxy, event_type, event, refcon):
+        current_time = time.time()
+        if event_type in [Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp]:
+            if (current_time - self.last_key_time) < self.palm_threshold:
+                return None
+        if event_type == Quartz.kCGEventKeyDown:
+            self.last_key_time = current_time
+            flags = Quartz.CGEventGetFlags(event)
+            keycode = Quartz.CGEventGetIntegerPropertyValue(event, Quartz.kCGKeyboardEventKeycode)
+            if keycode in [8, 9, 7, 6, 0] and (flags & Quartz.kCGEventFlagMaskControl):
+                flags &= ~Quartz.kCGEventFlagMaskControl
+                flags |= Quartz.kCGEventFlagMaskCommand
+                Quartz.CGEventSetFlags(event, flags)
+            if keycode == 48 and (flags & Quartz.kCGEventFlagMaskCommand):
+                ws = AppKit.NSWorkspace.sharedWorkspace()
+                app = ws.frontmostApplication()
+                if app:
+                    app.activateWithOptions_(AppKit.NSApplicationActivateIgnoringOtherApps)
+        return event
+
+def run_tap():
+    engine = PunksEngine()
+    mask = (Quartz.CGEventMaskBit(Quartz.kCGEventKeyDown) | Quartz.CGEventMaskBit(Quartz.kCGEventLeftMouseDown) | Quartz.CGEventMaskBit(Quartz.kCGEventLeftMouseUp))
+    event_tap = Quartz.CGEventTapCreate(Quartz.kCGSessionEventTap, Quartz.kCGHeadInsertEventTap, Quartz.kCGEventTapOptionDefault, mask, engine.event_callback, None)
+    if not event_tap: sys.exit(1)
+    run_loop_source = Quartz.CFMachPortCreateRunLoopSource(None, event_tap, 0)
+    Quartz.CFRunLoopAddSource(Quartz.CFRunLoopGetCurrent(), run_loop_source, Quartz.kCGRunLoopCommonModes)
+    Quartz.CGEventTapEnable(event_tap, True)
+    Quartz.CFRunLoopRun()
 
 class WindowsInApple:
     def __init__(self):
+        app = AppKit.NSApplication.sharedApplication()
+        app.setActivationPolicy_(AppKit.NSApplicationActivationPolicyAccessory)
         self.root = tk.Tk()
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
         self.root.attributes("-transparent", True)
         self.root.config(bg='systemTransparent')
-        
         self.root.tk.call('tk', 'unsupported', 'MacWindowStyle', 'style', self.root._w, 'help', 'none')
-        
-        self.canvas = tk.Canvas(self.root, highlightthickness=0, bd=0, insertwidth=0, bg='systemTransparent', bd=0)
+        self.canvas = tk.Canvas(self.root, highlightthickness=0, bd=0, bg='systemTransparent')
         self.canvas.pack(fill="both", expand=True)
-        self.run()
+        self.chrome_bg = "#35363a"
+        self.update_loop()
+        self.root.mainloop()
 
-    def run(self):
-        while True:
+    def update_loop(self):
+        try:
             self.canvas.delete("all")
-            windows = CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly, kCGNullWindowID)
-            for window in windows:
-                if window.get("kCGWindowLayer", 0) != 0 or not window.get("kCGWindowIsOnscreen"):
-                    continue
-                
-                name = window.get("kCGWindowName", "")
-                owner = window.get("kCGWindowOwnerName", "")
-                bounds = window.get("kCGWindowBounds")
-                
-                if bounds:
+            windows = Quartz.CGWindowListCopyWindowInfo(Quartz.kCGWindowListOptionOnScreenOnly, Quartz.kCGNullWindowID)
+            for w_info in windows:
+                if w_info.get("kCGWindowLayer", 0) != 0: continue
+                owner = w_info.get("kCGWindowOwnerName", "")
+                bounds = w_info.get("kCGWindowBounds")
+                if bounds and owner not in ["WindowsintheApple", "Window Server", "Dock"]:
                     x, y, w, h = bounds['X'], bounds['Y'], bounds['Width'], bounds['Height']
-                    
-                    if "Google Chrome" in owner:
-                        self.canvas.create_rectangle(x - 20, y - 20, x + w + 20, y + 60, 
-                                                   fill=self.chrome_gray, outline=self.chrome_gray)
+                    if w > 300 and h > 100:
+                        # Left Mask: Three surgical circles over native traffic lights
+                        for i, offset in enumerate([12, 32, 52]):
+                            self.canvas.create_oval(x + offset, y + 10, x + offset + 14, y + 24, fill=self.chrome_bg, outline=self.chrome_bg)
                         
-
-            self.root.update_idletasks()
-            self.root.update_idletasks(); self.root.update()
-            self.root.update_idletasks(); self.root.update(); self.root.update_idletasks(); self.root.update(); time.sleep(0.008)
+                        # Right Side: Windows layout moved left to avoid extensions (300px offset)
+                        rx = x + w - 300
+                        ry = y + 8
+                        self.canvas.create_oval(rx + 44, ry, rx + 58, ry + 14, fill="#ff5f57", outline="#cf443e")
+                        self.canvas.create_oval(rx + 22, ry, rx + 36, ry + 14, fill="#ffbd2e", outline="#cfa023")
+                        self.canvas.create_oval(rx, ry, rx + 14, ry + 14, fill="#28c940", outline="#1aab29")
+        except: pass
+        self.root.after(50, self.update_loop)
 
 if __name__ == "__main__":
+    t = threading.Thread(target=run_tap, daemon=True)
+    t.start()
     WindowsInApple()
