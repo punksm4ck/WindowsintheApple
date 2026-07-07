@@ -1,0 +1,713 @@
+#!/usr/bin/env python3
+"""
+WindowsintheApple v5 — Windows-style titlebar skin for macOS
+==============================================================
+Continuously swaps live pixel content between the real macOS traffic-light
+cluster (top-left of the titlebar) and a same-sized slot on the right side,
+and remaps Ctrl-based shortcuts to Cmd system-wide (except inside nano).
+
+Architecture notes (v5 changes from v4):
+- REPLACED the flat-color mask with a genuine bidirectional LIVE MIRROR.
+  v4 sampled one median color and drew a flat fill over the traffic
+  lights, then drew separately-colored fake circles on the right. That
+  worked but wasn't what was asked for: an actual live picture-in-picture
+  swap. v5 instead:
+    1. Captures the real traffic-light region (LEFT_RECT) every tick.
+    2. Captures whatever is really sitting in the right-side slot
+       (RIGHT_RECT) every tick, BEFORE painting over it.
+    3. Paints the LEFT capture into RIGHT_RECT (so the real traffic
+       lights appear to have moved to the right).
+    4. Paints the RIGHT capture into LEFT_RECT (so whatever content was
+       really at the right slot now covers the real traffic lights,
+       hiding them without a flat/fake color).
+  This is genuinely more expensive than v4's cached flat color (two
+  CGWindowListCreateImage calls per tick instead of one, at a faster
+  cadence — see MIRROR_INTERVAL) because a live mirror has to be
+  re-captured continuously to avoid looking stale as either region's
+  real content changes (hover highlights, tab animations, etc).
+- REMOVED BUTTON_SKIN_ALLOWLIST and the Chrome-specific fake pill. Per
+  explicit instruction, the swap now applies universally to every
+  non-skipped, non-fullscreen window, not just an allowlisted subset.
+- Click forwarding is remapped: the hit-test window now sits over
+  RIGHT_RECT (since that's where the traffic lights visually are now).
+  A click's X position within RIGHT_RECT is translated back to the
+  equivalent offset within LEFT_RECT to determine which real AX button
+  (close/minimize/zoom) was "clicked" — the mapping is 1:1 because the
+  mirrored image is a pixel-exact copy, so relative offsets match.
+- Full-screen detection, AX-based geometry, single-instance lockfiles,
+  and the exception-wrapped entry points are all carried forward
+  unchanged from v4.
+
+Carried forward from v3/v4:
+- Window/button geometry comes from the Accessibility API (AXUIElement),
+  not CGWindowListCopyWindowInfo, since CGWindowList's bounds/name fields
+  are increasingly gated behind Screen Recording TCC.
+- Frontmost-app tracking uses NSWorkspace notifications, with a slow
+  0.3s safety-net poll purely to catch in-place resizes/moves. The
+  mirror itself runs on its own faster timer (see MIRROR_INTERVAL).
+- Single-instance guard via a lockfile prevents duplicate launches.
+
+Requires Screen Recording permission (System Settings > Privacy &
+Security > Screen Recording) for whatever process runs this script.
+"""
+
+import objc
+import AppKit
+import Quartz
+import ApplicationServices as AX
+import subprocess
+import time
+import sys
+import os
+import fcntl
+import logging
+import logging.handlers
+import threading
+
+# ============================================================================
+# CONFIG
+# ============================================================================
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+LOCK_PATH = "/tmp/windowsintheapple.lock"
+LOG_PATH = "/tmp/windowsintheapple.log"
+
+# Window level for the visual mask overlay. Must sit ABOVE normal app
+# windows (kCGNormalWindowLevel == 0) so the mirrored paint is visible,
+# but BELOW transient UI like context menus (kCGPopUpMenuWindowLevel ==
+# 101). kCGUtilityWindowLevel (19) is the sweet spot used by most
+# menu-bar/overlay-style utilities on macOS.
+OVERLAY_LEVEL = Quartz.kCGUtilityWindowLevel
+
+# --- Mirror geometry ---
+# Both rects are the SAME size, since we're swapping pixel content
+# between them 1:1. Sized generously enough to cover a real traffic-light
+# cluster with padding, and reused verbatim as the right-side slot.
+MIRROR_W = 84
+MIRROR_H = 22
+MIRROR_X_OFFSET = 2   # left rect starts this far in from the window's left edge
+MIRROR_Y_OFFSET = 2   # and this far down from the window's top edge
+RIGHT_MARGIN = 6       # right rect ends this far in from the window's right edge
+
+# --- Mirror timing ---
+# Faster than the old flat-color cache (v4's 2s TTL) because live pixel
+# content goes stale fast — hover highlights, tab load animations, etc.
+# ~8fps is enough to look live without hammering CGWindowListCreateImage.
+MIRROR_INTERVAL = 0.125
+
+_TERMINAL_APPS = frozenset({"Terminal", "iTerm2", "iTerm", "Hyper", "Alacritty", "Warp"})
+_SKIP_APPS = frozenset({"Window Server", "Dock", "loginwindow", "ControlCenter",
+                         "SystemUIServer", "Notification Center", "Spotlight"})
+
+# ============================================================================
+# LOGGING
+# ============================================================================
+logger = logging.getLogger("WindowsintheApple")
+logger.setLevel(logging.INFO)
+_handler = logging.handlers.RotatingFileHandler(LOG_PATH, maxBytes=1_000_000, backupCount=2)
+_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+logger.addHandler(_handler)
+
+# ============================================================================
+# SINGLE-INSTANCE GUARD (applies separately to main process and --tap process)
+# ============================================================================
+_lock_handles = []  # keep fd references alive for process lifetime
+
+def _acquire_singleton_lock(tag: str):
+    path = f"{LOCK_PATH}.{tag}"
+    fp = open(path, "w")
+    try:
+        fcntl.flock(fp, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        logger.warning(f"Another instance ({tag}) is already running — exiting.")
+        fp.close()
+        sys.exit(0)
+    fp.write(str(os.getpid()))
+    fp.flush()
+    _lock_handles.append(fp)
+    return fp
+
+# ============================================================================
+# ACCESSIBILITY HELPERS
+# ============================================================================
+def _ax_value_to_tuple(ax_value, value_type):
+    ok, out = AX.AXValueGetValue(ax_value, value_type, None)
+    return out if ok else None
+
+def get_frontmost_app_pid():
+    active = AppKit.NSWorkspace.sharedWorkspace().frontmostApplication()
+    if not active:
+        return None, None
+    return active.processIdentifier(), (active.localizedName() or "")
+
+def _find_window_via_children(app_ref):
+    """Fallback for apps (e.g. Chrome/Chromium before its native
+    accessibility mode is activated) where kAXFocusedWindowAttribute and
+    kAXMainWindowAttribute return kAXErrorNotImplemented (-25212) instead
+    of a real window. Walks AXChildren directly. Prefers whichever
+    AXWindow reports AXMain == True."""
+    err_c, children = AX.AXUIElementCopyAttributeValue(app_ref, AX.kAXChildrenAttribute, None)
+    if err_c != AX.kAXErrorSuccess or not children:
+        return None
+    first_window = None
+    for child in children:
+        err_r, role = AX.AXUIElementCopyAttributeValue(child, AX.kAXRoleAttribute, None)
+        if err_r != AX.kAXErrorSuccess or role != AX.kAXWindowRole:
+            continue
+        if first_window is None:
+            first_window = child
+        err_m, is_main = AX.AXUIElementCopyAttributeValue(child, AX.kAXMainAttribute, None)
+        if err_m == AX.kAXErrorSuccess and is_main:
+            return child
+    return first_window
+
+def get_ax_window_and_frame(pid):
+    """Returns (ax_window_element, (x, y, w, h)) for the frontmost app's
+    focused/main window, using the Accessibility API only. Returns
+    (None, None) if unavailable."""
+    try:
+        app_ref = AX.AXUIElementCreateApplication(pid)
+        err, win = AX.AXUIElementCopyAttributeValue(app_ref, AX.kAXFocusedWindowAttribute, None)
+        if err != AX.kAXErrorSuccess or win is None:
+            err, win = AX.AXUIElementCopyAttributeValue(app_ref, AX.kAXMainWindowAttribute, None)
+        if err != AX.kAXErrorSuccess or win is None:
+            win = _find_window_via_children(app_ref)
+            if win is None:
+                return None, None
+
+        err, pos_val = AX.AXUIElementCopyAttributeValue(win, AX.kAXPositionAttribute, None)
+        err2, size_val = AX.AXUIElementCopyAttributeValue(win, AX.kAXSizeAttribute, None)
+        if err != AX.kAXErrorSuccess or err2 != AX.kAXErrorSuccess:
+            return None, None
+
+        pos = _ax_value_to_tuple(pos_val, AX.kAXValueCGPointType)
+        size = _ax_value_to_tuple(size_val, AX.kAXValueCGSizeType)
+        if pos is None or size is None:
+            return None, None
+
+        return win, (pos.x, pos.y, size.width, size.height)
+    except Exception:
+        logger.exception("get_ax_window_and_frame failed")
+        return None, None
+
+def is_ax_window_fullscreen(win):
+    """Full-screen windows have no real titlebar to mirror. Attempting to
+    do so is undefined behavior, so the caller should skip entirely."""
+    if win is None:
+        return False
+    try:
+        err, val = AX.AXUIElementCopyAttributeValue(win, "AXFullScreen", None)
+        if err == AX.kAXErrorSuccess and val is not None:
+            return bool(val)
+    except Exception:
+        logger.exception("is_ax_window_fullscreen failed")
+    return False
+
+def get_all_traffic_light_frames(pid):
+    """Returns {label: (x, y, w, h)} for close/minimize/zoom real AX
+    button frames, or None entries where an app doesn't expose them."""
+    try:
+        app_ref = AX.AXUIElementCreateApplication(pid)
+        err, win = AX.AXUIElementCopyAttributeValue(app_ref, AX.kAXFocusedWindowAttribute, None)
+        if err != AX.kAXErrorSuccess or win is None:
+            win = _find_window_via_children(app_ref)
+            if win is None:
+                return None
+        out = {}
+        for label, attr in [("close", AX.kAXCloseButtonAttribute),
+                             ("minimize", AX.kAXMinimizeButtonAttribute),
+                             ("zoom", AX.kAXZoomButtonAttribute)]:
+            err, btn = AX.AXUIElementCopyAttributeValue(win, attr, None)
+            if err != AX.kAXErrorSuccess or btn is None:
+                out[label] = None
+                continue
+            err2, pos_val = AX.AXUIElementCopyAttributeValue(btn, AX.kAXPositionAttribute, None)
+            err3, size_val = AX.AXUIElementCopyAttributeValue(btn, AX.kAXSizeAttribute, None)
+            pos = _ax_value_to_tuple(pos_val, AX.kAXValueCGPointType) if err2 == AX.kAXErrorSuccess else None
+            size = _ax_value_to_tuple(size_val, AX.kAXValueCGSizeType) if err3 == AX.kAXErrorSuccess else None
+            out[label] = (pos.x, pos.y, size.width, size.height) if pos and size else None
+        return out
+    except Exception:
+        logger.exception("get_all_traffic_light_frames failed")
+        return None
+
+def get_ax_button(win, attr):
+    try:
+        err, btn = AX.AXUIElementCopyAttributeValue(win, attr, None)
+        if err == AX.kAXErrorSuccess and btn is not None:
+            return btn
+    except Exception:
+        logger.exception(f"get_ax_button failed for {attr}")
+    return None
+
+def press_ax_button(btn, label=""):
+    if btn is None:
+        logger.warning(f"press_ax_button: {label} button reference is None")
+        return False
+    try:
+        err = AX.AXUIElementPerformAction(btn, AX.kAXPressAction)
+        if err != AX.kAXErrorSuccess:
+            logger.warning(f"press_ax_button: {label} AXUIElementPerformAction failed, err={err}")
+            return False
+        logger.info(f"press_ax_button: {label} succeeded")
+        return True
+    except Exception:
+        logger.exception(f"press_ax_button: {label} raised exception")
+        return False
+
+# ============================================================================
+# LIVE REGION CAPTURE — the actual v5 mirror mechanism
+# ============================================================================
+def capture_region_cgimage(x, y, w, h, exclude_window_number=0):
+    """Captures a raw CGImage of on-screen content at (x, y, w, h).
+
+    exclude_window_number: our own overlay's CGWindowID. We composite
+    only what is genuinely BELOW that window, so a live mirror never
+    captures its own previously-painted frame (which would produce
+    visible feedback/ghosting instead of a clean live swap).
+    """
+    try:
+        if w <= 0 or h <= 0:
+            return None
+        rect = Quartz.CGRectMake(x, y, w, h)
+        list_option = (Quartz.kCGWindowListOptionOnScreenBelowWindow
+                       if exclude_window_number else Quartz.kCGWindowListOptionOnScreenOnly)
+        window_id = exclude_window_number if exclude_window_number else Quartz.kCGNullWindowID
+        return Quartz.CGWindowListCreateImage(rect, list_option, window_id, Quartz.kCGWindowImageDefault)
+    except Exception:
+        logger.exception("capture_region_cgimage failed")
+        return None
+
+def cgimage_to_nsimage(cgimage):
+    if cgimage is None:
+        return None
+    try:
+        w = Quartz.CGImageGetWidth(cgimage)
+        h = Quartz.CGImageGetHeight(cgimage)
+        if w == 0 or h == 0:
+            return None
+        return AppKit.NSImage.alloc().initWithCGImage_size_(cgimage, AppKit.NSMakeSize(w, h))
+    except Exception:
+        logger.exception("cgimage_to_nsimage failed")
+        return None
+
+# ============================================================================
+# KEYLOGGER ENGINE (Ctrl -> Cmd Remap) — unchanged from v4
+# ============================================================================
+if len(sys.argv) > 1 and sys.argv[1] == "--tap":
+    _lockfp = _acquire_singleton_lock("tap")
+    sys.stderr = open(os.devnull, 'w')
+    _ALWAYS_REMAP = frozenset({1, 3, 9, 13, 15, 16, 17, 35, 45})
+    _NANO_SENSITIVE = frozenset({0, 6, 7, 8})
+    _nano_cache_time = 0.0
+    _nano_cache_value = False
+
+    def _is_nano_active() -> bool:
+        global _nano_cache_time, _nano_cache_value
+        now = time.monotonic()
+        if now - _nano_cache_time < 0.15:
+            return _nano_cache_value
+        _nano_cache_time = now
+        result = False
+        try:
+            active = AppKit.NSWorkspace.sharedWorkspace().frontmostApplication()
+            if active and (active.localizedName() or "") in _TERMINAL_APPS:
+                pid = active.processIdentifier()
+                wlist = Quartz.CGWindowListCopyWindowInfo(
+                    Quartz.kCGWindowListOptionOnScreenOnly, Quartz.kCGNullWindowID)
+                if wlist:
+                    for w in wlist:
+                        if w.get("kCGWindowOwnerPID") != pid or w.get("kCGWindowLayer", 0) != 0:
+                            continue
+                        title = (w.get("kCGWindowName") or "").strip().lower()
+                        if title == "nano" or title.startswith("nano ") or " nano" in title or title.startswith("sudo nano"):
+                            result = True
+                            break
+        except Exception:
+            logger.exception("_is_nano_active failed")
+        _nano_cache_value = result
+        return result
+
+    class _KeyEngine:
+        def event_callback(self, proxy, event_type, event, refcon):
+            try:
+                if event_type != Quartz.kCGEventKeyDown:
+                    return event
+                flags = Quartz.CGEventGetFlags(event)
+                keycode = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGKeyboardEventKeycode)
+                ctrl_only = (flags & Quartz.kCGEventFlagMaskControl) and \
+                            not (flags & Quartz.kCGEventFlagMaskCommand) and \
+                            not (flags & Quartz.kCGEventFlagMaskAlternate)
+                if not ctrl_only:
+                    return event
+                if keycode in _ALWAYS_REMAP:
+                    flags &= ~Quartz.kCGEventFlagMaskControl
+                    flags |= Quartz.kCGEventFlagMaskCommand
+                    Quartz.CGEventSetFlags(event, flags)
+                    return event
+                if keycode in _NANO_SENSITIVE and not _is_nano_active():
+                    flags &= ~Quartz.kCGEventFlagMaskControl
+                    flags |= Quartz.kCGEventFlagMaskCommand
+                    Quartz.CGEventSetFlags(event, flags)
+            except Exception:
+                logger.exception("event_callback failed")
+            return event
+
+    _engine = _KeyEngine()
+    _mask = Quartz.CGEventMaskBit(Quartz.kCGEventKeyDown)
+    _tap = Quartz.CGEventTapCreate(
+        Quartz.kCGSessionEventTap, Quartz.kCGHeadInsertEventTap, 0,
+        _mask, _engine.event_callback, None)
+    if _tap:
+        _src = Quartz.CFMachPortCreateRunLoopSource(None, _tap, 0)
+        Quartz.CFRunLoopAddSource(Quartz.CFRunLoopGetCurrent(), _src, Quartz.kCFRunLoopCommonModes)
+        Quartz.CGEventTapEnable(_tap, True)
+        logger.info("Keyboard tap started.")
+        Quartz.CFRunLoopRun()
+    else:
+        logger.error("Failed to create event tap — check Accessibility permission.")
+    sys.exit(0)
+
+# ============================================================================
+# GUI ENGINE (Live Bidirectional Mirror)
+# ============================================================================
+_lockfp = _acquire_singleton_lock("main")
+sys.stderr = open(os.devnull, 'w')
+
+
+class GhostPanel(AppKit.NSPanel):
+    """Full-screen, click-through visual mask layer."""
+    def canBecomeKeyWindow(self): return False
+    def canBecomeMainWindow(self): return False
+    def acceptsMouseMovedEvents(self): return False
+
+
+class HitTestWindow(AppKit.NSPanel):
+    """A tiny, click-ACCEPTING window placed exactly over the mirrored
+    traffic-light image on the right. This is what makes the mirrored
+    close/minimize/zoom buttons actually work."""
+    def canBecomeKeyWindow(self): return False
+    def canBecomeMainWindow(self): return False
+
+
+class HitTestView(AppKit.NSView):
+    def initWithFrame_controller_(self, frame, controller):
+        self = objc.super(HitTestView, self).initWithFrame_(frame)
+        if self is None:
+            return None
+        self._controller = controller
+        return self
+
+    def acceptsFirstMouse_(self, event):
+        # CRITICAL: without this, AppKit treats the first click on a
+        # non-key, non-activating window as a "wake up" event only and
+        # never delivers mouseDown_ to the view.
+        return True
+
+    def mouseDown_(self, event):
+        loc = event.locationInWindow()
+        logger.info(f"Button hit-window click at local ({loc.x:.0f}, {loc.y:.0f})")
+        self._controller.handle_button_click(loc.x, loc.y)
+
+    def mouseMoved_(self, event):
+        pass
+
+    def mouseEntered_(self, event):
+        pass
+
+    def updateTrackingAreas(self):
+        objc.super(HitTestView, self).updateTrackingAreas()
+        for ta in list(self.trackingAreas()):
+            self.removeTrackingArea_(ta)
+        ta = AppKit.NSTrackingArea.alloc().initWithRect_options_owner_userInfo_(
+            self.bounds(),
+            AppKit.NSTrackingActiveAlways | AppKit.NSTrackingMouseEnteredAndExited | AppKit.NSTrackingMouseMoved,
+            self, None)
+        self.addTrackingArea_(ta)
+
+
+class OverlayView(AppKit.NSView):
+    """Draws the swapped images. self._state is either None (no skin
+    this tick) or (x, y, w, h, left_img, right_img) where left_img is
+    what was captured FROM the left rect (painted INTO the right rect)
+    and right_img is what was captured FROM the right rect (painted
+    INTO the left rect)."""
+    def isFlipped(self): return True
+    def acceptsFirstResponder(self): return False
+    def mouseDownCanMoveWindow(self): return False
+
+    def setState_(self, state):
+        self._state = state
+
+    def drawRect_(self, _dirty):
+        try:
+            AppKit.NSColor.clearColor().set()
+            AppKit.NSRectFill(self.bounds())
+
+            state = getattr(self, "_state", None)
+            if not state:
+                return
+            x, y, w, h, left_img, right_img = state
+
+            left_rect = AppKit.NSMakeRect(x + MIRROR_X_OFFSET, y + MIRROR_Y_OFFSET, MIRROR_W, MIRROR_H)
+            right_rect = AppKit.NSMakeRect(x + w - RIGHT_MARGIN - MIRROR_W, y + MIRROR_Y_OFFSET, MIRROR_W, MIRROR_H)
+
+            # Swap: whatever was really on the right now covers the real
+            # traffic lights on the left...
+            if right_img is not None:
+                right_img.drawInRect_(left_rect)
+            # ...and the real traffic lights now appear on the right.
+            if left_img is not None:
+                left_img.drawInRect_(right_rect)
+        except Exception:
+            logger.exception("drawRect_ failed")
+
+
+class AppDelegate(AppKit.NSObject):
+    def applicationDidFinishLaunching_(self, notification):
+        try:
+            screens = AppKit.NSScreen.screens()
+            frame = screens[0].frame()
+            for s in screens[1:]:
+                frame = AppKit.NSUnionRect(frame, s.frame())
+
+            self._window = GhostPanel.alloc().initWithContentRect_styleMask_backing_defer_(
+                frame, 128, AppKit.NSBackingStoreBuffered, False)
+            self._window.setLevel_(OVERLAY_LEVEL)
+            self._window.setHasShadow_(False)
+            self._window.setOpaque_(False)
+            self._window.setBackgroundColor_(AppKit.NSColor.clearColor())
+            self._window.setIgnoresMouseEvents_(True)
+            self._window.setCollectionBehavior_(1 | 16 | 64)
+            self._window.setFloatingPanel_(True)
+            self._window.setBecomesKeyOnlyIfNeeded_(True)
+
+            self._view = OverlayView.alloc().initWithFrame_(frame)
+            self._window.setContentView_(self._view)
+            self._window.orderFrontRegardless()
+
+            self._hit_window = HitTestWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+                AppKit.NSMakeRect(0, 0, 1, 1), 128, AppKit.NSBackingStoreBuffered, False)
+            self._hit_window.setLevel_(OVERLAY_LEVEL + 1)
+            self._hit_window.setOpaque_(False)
+            self._hit_window.setBackgroundColor_(AppKit.NSColor.clearColor())
+            self._hit_window.setHasShadow_(False)
+            self._hit_view = HitTestView.alloc().initWithFrame_controller_(
+                AppKit.NSMakeRect(0, 0, 1, 1), self)
+            self._hit_window.setContentView_(self._hit_view)
+            self._hit_window.setIgnoresMouseEvents_(False)
+            self._hit_window.setAcceptsMouseMovedEvents_(True)
+            self._hit_window.orderOut_(None)
+
+            self._current_ax_window = None
+            self._current_pid = None
+            self._current_frame = None  # (x, y, w, h)
+            self._button_offsets = None  # {"close": dx, "minimize": dx, "zoom": dx} within MIRROR_W
+            self._last_state = None
+
+            nc = AppKit.NSWorkspace.sharedWorkspace().notificationCenter()
+            nc.addObserver_selector_name_object_(
+                self, objc.selector(self.onAppSwitch_, signature=b'v@:@'),
+                AppKit.NSWorkspaceDidActivateApplicationNotification, None)
+
+            # Slow poll: catches app switches / resizes / moves and
+            # recomputes button offsets (AX calls are comparatively
+            # expensive, so this runs at a relaxed cadence).
+            def _slow_loop():
+                while True:
+                    time.sleep(0.3)
+                    self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                        objc.selector(self._slowTick_, signature=b'v@:@'), None, False)
+            threading.Thread(target=_slow_loop, daemon=True).start()
+
+            # Fast mirror timer: the actual live swap. Runs independently
+            # of the slow tick so the picture stays live even between
+            # slow-tick refreshes.
+            def _mirror_loop():
+                while True:
+                    time.sleep(MIRROR_INTERVAL)
+                    self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                        objc.selector(self._mirrorTick_, signature=b'v@:@'), None, False)
+            threading.Thread(target=_mirror_loop, daemon=True).start()
+
+            self._slowTick_(None)
+
+            import threading
+            def _heartbeat():
+                n = 0
+                while True:
+                    time.sleep(1.0)
+                    n += 1
+                    logger.info(f"HEARTBEAT: {n} (pure python thread, no NSTimer)")
+            threading.Thread(target=_heartbeat, daemon=True).start()
+
+            logger.info("AppDelegate launched. Overlay level=%s, mirror_interval=%s", OVERLAY_LEVEL, MIRROR_INTERVAL)
+        except Exception:
+            logger.exception("applicationDidFinishLaunching_ failed — overlay may be non-functional")
+
+    def onAppSwitch_(self, _note):
+        self._slowTick_(None)
+
+    def _slowTick_(self, _timer):
+        """Recomputes which window we're skinning, its frame, and the
+        real AX button offsets used for click-forwarding. Does NOT do
+        any pixel capture itself — that's the fast mirror timer's job."""
+        try:
+            pid, active_name = get_frontmost_app_pid()
+            if pid is None or active_name in _SKIP_APPS:
+                logger.info(f"SLOWTICK: no pid or skipped app (pid={pid}, name={active_name})")
+                self._clear_skin()
+                return
+
+            ax_win, win_frame = get_ax_window_and_frame(pid)
+            if win_frame is None:
+                logger.info(f"SLOWTICK: no AX window frame for pid={pid} name={active_name}")
+                self._clear_skin()
+                return
+
+            x, y, w, h = win_frame
+            if w < 250 or h < 150:
+                logger.info(f"SLOWTICK: window too small w={w} h={h} name={active_name}")
+                self._clear_skin()
+                return
+
+            if is_ax_window_fullscreen(ax_win):
+                logger.info(f"SLOWTICK: fullscreen, skipping name={active_name}")
+                # No real titlebar exists when full-screen — mirroring it
+                # is undefined and was never correct in prior versions.
+                self._clear_skin()
+                return
+
+            all_lights = get_all_traffic_light_frames(pid)
+            fallback_offsets = {"close": 6, "minimize": 29, "zoom": 52}
+            offsets = {}
+            for label in ("close", "minimize", "zoom"):
+                btn_frame = all_lights.get(label) if all_lights else None
+                if btn_frame:
+                    offsets[label] = btn_frame[0] - x  # dx from window's left edge
+                else:
+                    offsets[label] = fallback_offsets[label]
+
+            self._current_ax_window = ax_win
+            self._current_pid = pid
+            self._current_frame = (x, y, w, h)
+            self._button_offsets = offsets
+            logger.info(f"SLOWTICK: tracking name={active_name} frame=({x},{y},{w},{h})")
+
+            self._position_hit_window(x, y, w, h)
+        except Exception:
+            logger.exception("_slowTick_ failed")
+
+    def _clear_skin(self):
+        self._current_ax_window = None
+        self._current_pid = None
+        self._current_frame = None
+        self._button_offsets = None
+        self._set_state(None)
+        self._hit_window.orderOut_(None)
+
+    def _mirrorTick_(self, _timer):
+        logger.info("MIRRORTICK: fired")
+        """The actual v5 mechanism: capture both rects fresh, then paint
+        each one into the OTHER rect's position. Runs at MIRROR_INTERVAL
+        regardless of the slow tick's cadence, so the swap stays live."""
+        try:
+            if self._current_frame is None:
+                return
+            x, y, w, h = self._current_frame
+
+            left_x, left_y = x + MIRROR_X_OFFSET, y + MIRROR_Y_OFFSET
+            right_x, right_y = x + w - RIGHT_MARGIN - MIRROR_W, y + MIRROR_Y_OFFSET
+
+            exclude = self._window.windowNumber()
+            left_cg = capture_region_cgimage(left_x, left_y, MIRROR_W, MIRROR_H, exclude)
+            right_cg = capture_region_cgimage(right_x, right_y, MIRROR_W, MIRROR_H, exclude)
+
+            left_img = cgimage_to_nsimage(left_cg)
+            right_img = cgimage_to_nsimage(right_cg)
+
+            if left_img is None and right_img is None:
+                logger.warning("MIRROR: both captures returned None — likely missing Screen Recording permission for this binary")
+                # Capture failed entirely this tick (e.g. permission
+                # hiccup) — leave the previous frame showing rather than
+                # flashing to blank.
+                return
+
+            self._set_state((x, y, w, h, left_img, right_img))
+        except Exception:
+            logger.exception("_mirrorTick_ failed")
+
+    def _set_state(self, state):
+        if state != self._last_state:
+            self._last_state = state
+            self._view.setState_(state)
+            self._view.setNeedsDisplay_(True)
+
+    def _position_hit_window(self, x, y, w, h):
+        """Positions the click-catcher over RIGHT_RECT — that's where
+        the mirrored traffic-light image now visually sits."""
+        try:
+            screens = AppKit.NSScreen.screens()
+            union = screens[0].frame()
+            for s in screens[1:]:
+                union = AppKit.NSUnionRect(union, s.frame())
+            screen_top = union.origin.y + union.size.height
+
+            right_x = x + w - RIGHT_MARGIN - MIRROR_W
+            top_left_y = y + MIRROR_Y_OFFSET
+            bottom_left_y = screen_top - top_left_y - MIRROR_H
+
+            frame = AppKit.NSMakeRect(right_x, bottom_left_y, MIRROR_W, MIRROR_H)
+            self._hit_window.setFrame_display_(frame, True)
+            self._hit_window.orderFrontRegardless()
+        except Exception:
+            logger.exception("_position_hit_window failed")
+            self._hit_window.orderOut_(None)
+
+    def handle_button_click(self, local_x, local_y):
+        """local_x is within the hit window (0..MIRROR_W), which sits
+        over the mirrored image copied FROM the left rect. Because the
+        mirror is a pixel-exact copy, local_x maps 1:1 to the same
+        offset within the real left rect — so we compare it against the
+        real AX button dx offsets (relative to the window's left edge,
+        same coordinate space as MIRROR_X_OFFSET) to figure out which
+        button was actually clicked."""
+        if self._current_ax_window is None or self._button_offsets is None:
+            return
+        try:
+            # local_x is relative to the hit window's own left edge, which
+            # sits at (right_x). Translate to the equivalent position in
+            # the left rect's coordinate space by adding MIRROR_X_OFFSET.
+            equivalent_dx = local_x + MIRROR_X_OFFSET
+
+            offsets = self._button_offsets
+            # Nearest-button match rather than exact ranges, since real
+            # AX button spacing varies slightly by app/OS version.
+            nearest = min(offsets, key=lambda label: abs(offsets[label] - equivalent_dx))
+
+            if nearest == "minimize":
+                btn = get_ax_button(self._current_ax_window, AX.kAXMinimizeButtonAttribute)
+                press_ax_button(btn, "Minimize")
+            elif nearest == "zoom":
+                btn = get_ax_button(self._current_ax_window, AX.kAXZoomButtonAttribute)
+                press_ax_button(btn, "Zoom")
+            else:
+                btn = get_ax_button(self._current_ax_window, AX.kAXCloseButtonAttribute)
+                press_ax_button(btn, "Close")
+        except Exception:
+            logger.exception("handle_button_click failed")
+
+
+if __name__ == "__main__":
+    existing = subprocess.run(
+        ["pgrep", "-f", f"{os.path.abspath(__file__)} --tap"],
+        capture_output=True, text=True)
+    if not existing.stdout.strip():
+        subprocess.Popen([sys.executable, os.path.abspath(__file__), "--tap"])
+    else:
+        logger.info("--tap already running, not spawning a duplicate.")
+
+    app = AppKit.NSApplication.sharedApplication()
+    app.setActivationPolicy_(AppKit.NSApplicationActivationPolicyAccessory)
+    delegate = AppDelegate.alloc().init()
+    app.setDelegate_(delegate)
+    AppKit.NSApp().run()

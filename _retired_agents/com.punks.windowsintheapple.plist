@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+ "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.punks.windowsintheapple</string>
+  <key>ProgramArguments</key><array>
+    <string>/usr/local/opt/python@3.14/bin/python3.14</string>
+    <string>/Users/tsannasardo/Scripts/WindowsintheApple/WindowsintheApple.py</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/Users/tsannasardo/Library/Logs/WindowsintheApple.log</string>
+  <key>StandardErrorPath</key><string>/Users/tsannasardo/Library/Logs/WindowsintheApple.log</string>
+</dict></plist>

@@ -1,0 +1,836 @@
+#!/usr/bin/env python3.12
+# -*- coding: utf-8 -*-
+"""
+═══════════════════════════════════════════════════════════════════════════
+  WINDOWSINTHEAPPLE  ·  v2.2  ·  PUNKS / AEGIS
+  v2.2: hide instantly on a missed tick but only destroy/rebuild after
+  MISS_TOLERANCE consecutive misses — v2.1's hysteresis fixed the flicker
+  but left a "ghost" mask/lights box lingering at a closed/switched
+  window's last position for a few ticks. Also carries v2.1's screen-aware
+  fullscreen guard (v2.0's guard always checked bounds against the PRIMARY
+  display even for windows on a secondary monitor).
+  Traffic lights on the RIGHT. Covered content mirrored on the LEFT.
+═══════════════════════════════════════════════════════════════════════════
+
+  Architecture (per skinned window):
+    ┌─ LEFT MASK ──────────┐          ┌─ RIGHT LIGHTS ────────────┐
+    │ covers native ●●●    │   ....   │ draws ● ● ● (hover glyphs)│
+    │ shows LIVE MIRROR of │          │ clicks → AXPress on the  │
+    │ the strip our lights │          │ REAL close/min/zoom       │
+    │ overlay covers       │          │ buttons                   │
+    └──────────────────────┘          └───────────────────────────┘
+
+  · Skins ALL windows of the frontmost app (z-order-correct illusion).
+  · 20 Hz position tracking, 2 Hz heavy refresh (mirror capture, colors).
+  · Live mirror uses CGWindowListCreateImage (macOS ≤ 14). On macOS 15+
+    where Apple removed it, falls back to a sampled-color solid mask.
+  · Fullscreen + tiny-window guards (carried over from v1).
+  · Zero AX polling in the hot loop — AX touched only on click + rescan.
+
+  Permissions required (System Settings → Privacy & Security):
+    · Accessibility      (button clicks, window control)
+    · Screen Recording   (live mirror; optional — degrades gracefully)
+
+  CLI:
+    python3.12 WindowsintheApple.py            run in foreground
+    python3.12 WindowsintheApple.py --debug    verbose logging
+    python3.12 WindowsintheApple.py --install  write + load launchd agent
+    python3.12 WindowsintheApple.py --uninstall
+═══════════════════════════════════════════════════════════════════════════
+"""
+
+import os
+import sys
+import math
+import time
+import signal
+import logging
+import subprocess
+from logging.handlers import RotatingFileHandler
+
+import objc
+from AppKit import (
+    NSApplication, NSApplicationActivationPolicyAccessory, NSWorkspace,
+    NSWindow, NSView, NSColor, NSScreen, NSBackingStoreBuffered,
+    NSWindowStyleMaskBorderless, NSBezierPath, NSTrackingArea,
+    NSTrackingMouseEnteredAndExited, NSTrackingMouseMoved,
+    NSTrackingActiveAlways, NSFloatingWindowLevel, NSImage,
+    NSCompositingOperationSourceOver, NSMakeRect, NSMakePoint,
+    NSWindowCollectionBehaviorCanJoinAllSpaces,
+    NSWindowCollectionBehaviorFullScreenAuxiliary,
+    NSWindowCollectionBehaviorTransient,
+)
+from Foundation import NSTimer, NSObject, NSRunLoop, NSRunLoopCommonModes
+import Quartz
+from Quartz import (
+    CGWindowListCopyWindowInfo, kCGWindowListOptionOnScreenOnly,
+    kCGWindowListExcludeDesktopElements, kCGNullWindowID,
+    kCGWindowListOptionIncludingWindow, CGRectNull,
+    CGImageGetWidth, CGImageGetHeight,
+)
+from ApplicationServices import (
+    AXUIElementCreateApplication, AXUIElementCopyAttributeValue,
+    AXUIElementPerformAction, AXIsProcessTrustedWithOptions,
+    AXValueGetValue, kAXValueCGPointType, kAXValueCGSizeType,
+)
+
+# ───────────────────────────── CONFIG ──────────────────────────────────────
+class CFG:
+    FAST_TICK          = 0.05     # 20 Hz — overlay position tracking
+    SLOW_TICK          = 0.50     # 2 Hz  — mirror capture, color, rescan
+    MIN_W, MIN_H       = 250, 150 # v1 guard: skip tiny windows
+    LIGHT_DIAM         = 12.0     # native traffic light diameter (pt)
+    LIGHT_SPACING      = 20.0     # native center-to-center spacing
+    EDGE_INSET         = 8.0      # close button gap from window edge
+    TITLEBAR_H         = 28.0     # default titlebar height fallback
+    MASK_W             = 78.0     # width of left mask (covers native ●●●)
+    LIGHTS_W           = 78.0     # width of right lights overlay
+    MIRROR_CONTENT     = True     # live-mirror covered content into mask
+    MIRROR_HZ_DIVIDER  = 1        # capture every Nth slow tick
+    SKIN_ALL_APPS      = True     # skin every eligible window system-wide,
+                                   # not just the frontmost app's — so the
+                                   # switcheroo sticks on background windows
+    MISS_TOLERANCE     = 4        # consecutive fast-ticks a window may be
+                                   # absent from CGWindowList before we tear
+                                   # its overlay down (hysteresis — kills the
+                                   # flicker-then-revert bug on Terminal/Chrome)
+    FALLBACK_OFFSETS   = {"close": 6, "minimize": 29, "zoom": 52}  # v1
+    IGNORED_APPS       = {"Dock", "Window Server", "Control Center",
+                          "Notification Center", "Spotlight",
+                          "WindowsintheApple"}
+    LOG_PATH  = os.path.expanduser("~/Library/Logs/WindowsintheApple.log")
+    PLIST     = os.path.expanduser(
+        "~/Library/LaunchAgents/com.punks.windowsintheapple.plist")
+
+# traffic light palette — pixel-matched to macOS
+COL_CLOSE  = (1.000, 0.373, 0.341)   # FF5F57
+COL_MIN    = (0.996, 0.737, 0.180)   # FEBC2E
+COL_ZOOM   = (0.157, 0.784, 0.251)   # 28C840
+COL_BORDER = 0.72                     # border darken factor
+COL_GLYPH  = (0.30, 0.10, 0.08)      # dark glyph tint
+
+# ───────────────────────────── LOGGING ─────────────────────────────────────
+logger = logging.getLogger("WITA")
+
+def setup_logging(debug: bool):
+    logger.setLevel(logging.DEBUG if debug else logging.INFO)
+    fmt = logging.Formatter("%(asctime)s %(levelname)-7s %(message)s",
+                            "%H:%M:%S")
+    fh = RotatingFileHandler(CFG.LOG_PATH, maxBytes=2_000_000, backupCount=2)
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+    # NOTE: intentionally no StreamHandler here. The launchd plist points
+    # StandardOutPath/StandardErrorPath at this SAME log file, so a
+    # StreamHandler writing to stdout was causing every line to be
+    # written twice (once via this file handler, once via launchd's own
+    # stdout redirection into the identical path). If you ever run this
+    # in the foreground for live debugging and want to see log output
+    # directly in the terminal, add a StreamHandler back temporarily.
+
+# ───────────────────────────── AX HELPERS ──────────────────────────────────
+def ax_attr(el, name):
+    err, val = AXUIElementCopyAttributeValue(el, name, None)
+    return val if err == 0 else None
+
+def ax_point(v):
+    ok, pt = AXValueGetValue(v, kAXValueCGPointType, None)
+    return (pt.x, pt.y) if ok else None
+
+def ax_size(v):
+    ok, sz = AXValueGetValue(v, kAXValueCGSizeType, None)
+    return (sz.width, sz.height) if ok else None
+
+def ax_frame(win):
+    p = ax_attr(win, "AXPosition")
+    s = ax_attr(win, "AXSize")
+    if p is None or s is None:
+        return None
+    pos, size = ax_point(p), ax_size(s)
+    if pos is None or size is None:
+        return None
+    return (pos[0], pos[1], size[0], size[1])   # global TOP-LEFT origin
+
+def app_ax_windows(pid):
+    app = AXUIElementCreateApplication(pid)
+    wins = ax_attr(app, "AXWindows")
+    return list(wins) if wins else []
+
+def find_ax_window(pid, cg_frame, tol=8.0):
+    """Match a CGWindow frame (top-left global) to its AXUIElement."""
+    x, y, w, h = cg_frame
+    best, best_d = None, tol * 4
+    for win in app_ax_windows(pid):
+        f = ax_frame(win)
+        if not f:
+            continue
+        d = abs(f[0]-x) + abs(f[1]-y) + abs(f[2]-w) + abs(f[3]-h)
+        if d < best_d:
+            best, best_d = win, d
+    return best
+
+def ax_is_fullscreen(win):
+    v = ax_attr(win, "AXFullScreen")
+    return bool(v)
+
+def press_traffic_light(pid, cg_frame, which):
+    """which ∈ close|minimize|zoom → AXPress the REAL button."""
+    win = find_ax_window(pid, cg_frame)
+    if win is None:
+        logger.warning("CLICK: no AX window match for %s", which)
+        return False
+    attr = {"close": "AXCloseButton",
+            "minimize": "AXMinimizeButton",
+            "zoom": "AXZoomButton"}[which]
+    btn = ax_attr(win, attr)
+    if btn is None:
+        logger.warning("CLICK: window lacks %s", attr)
+        return False
+    err = AXUIElementPerformAction(btn, "AXPress")
+    logger.info("CLICK: %s → AXPress err=%s", which, err)
+    return err == 0
+
+def native_lights_geometry(pid, cg_frame):
+    """Return (offsets dict, titlebar height) from real AX buttons,
+    v1 fallback if the app hides them. Partial AX results force full
+    fallback so mirrored spacing never comes out uneven."""
+    win = find_ax_window(pid, cg_frame)
+    offsets, tb_h = {}, CFG.TITLEBAR_H
+    if win is not None:
+        x0 = cg_frame[0]
+        for label, attr in (("close", "AXCloseButton"),
+                            ("minimize", "AXMinimizeButton"),
+                            ("zoom", "AXZoomButton")):
+            btn = ax_attr(win, attr)
+            f = ax_frame(btn) if btn is not None else None
+            if f:
+                offsets[label] = f[0] - x0
+                tb_h = max(tb_h, (f[1] - cg_frame[1]) + f[3] + 8)
+    if len(offsets) != 3:                       # all-or-nothing rule
+        offsets = dict(CFG.FALLBACK_OFFSETS)
+        tb_h = CFG.TITLEBAR_H
+    return offsets, tb_h
+
+# ─────────────────────── COORDINATES / CAPTURE ─────────────────────────────
+def primary_screen_h():
+    return NSScreen.screens()[0].frame().size.height
+
+def topleft_to_appkit(x, y_top, w, h):
+    """CG/AX global top-left → AppKit global bottom-left rect."""
+    return NSMakeRect(x, primary_screen_h() - (y_top + h), w, h)
+
+_capture_dead = False   # set True once the OS refuses (macOS 15+)
+
+def capture_window_strip(window_id, win_w, strip_w, strip_h):
+    """Live NSImage of the window's TOP-RIGHT strip (the region our
+    fake lights cover). None on failure → solid-color fallback."""
+    global _capture_dead
+    if _capture_dead or not CFG.MIRROR_CONTENT:
+        return None
+    try:
+        img = Quartz.CGWindowListCreateImage(
+            CGRectNull, kCGWindowListOptionIncludingWindow,
+            window_id, Quartz.kCGWindowImageBoundsIgnoreFraming)
+        if img is None:
+            _capture_dead = True
+            logger.warning("MIRROR: capture API unavailable "
+                           "(macOS 15+ or no Screen Recording perm) — "
+                           "falling back to solid mask")
+            return None
+        iw, ih = CGImageGetWidth(img), CGImageGetHeight(img)
+        if iw < 4 or ih < 4:
+            return None
+        scale = iw / max(win_w, 1.0)            # retina scale factor
+        crop = Quartz.CGRectMake(iw - strip_w * scale, 0,
+                                 strip_w * scale, strip_h * scale)
+        sub = Quartz.CGImageCreateWithImageInRect(img, crop)
+        if sub is None:
+            return None
+        ns = NSImage.alloc().initWithCGImage_size_(
+            sub, NSMakeRect(0, 0, strip_w, strip_h).size)
+        return ns
+    except Exception as e:
+        logger.debug("MIRROR: capture failed: %s", e)
+        return None
+
+def sample_titlebar_color(window_id, win_w):
+    """Average the top strip pixels → NSColor. Dark fallback."""
+    try:
+        img = Quartz.CGWindowListCreateImage(
+            CGRectNull, kCGWindowListOptionIncludingWindow,
+            window_id, Quartz.kCGWindowImageBoundsIgnoreFraming)
+        if img is None:
+            raise RuntimeError("no image")
+        from AppKit import NSBitmapImageRep
+        rep = NSBitmapImageRep.alloc().initWithCGImage_(img)
+        w = rep.pixelsWide()
+        y = min(6, rep.pixelsHigh() - 1)
+        xs = [int(w * f) for f in (0.35, 0.5, 0.65)]
+        r = g = b = 0.0
+        for x in xs:
+            c = rep.colorAtX_y_(x, y)
+            r += c.redComponent(); g += c.greenComponent()
+            b += c.blueComponent()
+        n = len(xs)
+        return NSColor.colorWithSRGBRed_green_blue_alpha_(r/n, g/n, b/n, 1.0)
+    except Exception:
+        return NSColor.colorWithSRGBRed_green_blue_alpha_(.13, .13, .14, 1.0)
+
+# ───────────────────────────── VIEWS ───────────────────────────────────────
+class MaskView(NSView):
+    """Left overlay: hides native ●●●, shows live mirror of covered strip."""
+    def initWithFrame_(self, frame):
+        self = objc.super(MaskView, self).initWithFrame_(frame)
+        if self is None:
+            return None
+        self.bg = NSColor.colorWithSRGBRed_green_blue_alpha_(.13,.13,.14,1)
+        self.mirror = None
+        return self
+
+    def drawRect_(self, rect):
+        self.bg.setFill()
+        NSBezierPath.fillRect_(self.bounds())
+        if self.mirror is not None:
+            self.mirror.drawInRect_fromRect_operation_fraction_(
+                self.bounds(), NSMakeRect(0, 0, 0, 0),
+                NSCompositingOperationSourceOver, 1.0)
+
+    # swallow clicks so the hidden native lights can't be hit by accident
+    def mouseDown_(self, event):  pass
+    def mouseUp_(self, event):    pass
+
+
+class LightsView(NSView):
+    """Right overlay: pixel-faithful traffic lights with hover glyphs.
+    Order mirrors the left cluster: [zoom, minimize, close→corner]."""
+    def initWithFrame_(self, frame):
+        self = objc.super(LightsView, self).initWithFrame_(frame)
+        if self is None:
+            return None
+        self.hovered = False
+        self.on_click = None          # callable(which)
+        self._tracking = None
+        return self
+
+    def updateTrackingAreas(self):
+        if self._tracking:
+            self.removeTrackingArea_(self._tracking)
+        self._tracking = NSTrackingArea.alloc().initWithRect_options_owner_userInfo_(
+            self.bounds(),
+            NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways,
+            self, None)
+        self.addTrackingArea_(self._tracking)
+        objc.super(LightsView, self).updateTrackingAreas()
+
+    def mouseEntered_(self, e):
+        self.hovered = True
+        self.setNeedsDisplay_(True)
+
+    def mouseExited_(self, e):
+        self.hovered = False
+        self.setNeedsDisplay_(True)
+
+    # geometry: three circles, close nearest the RIGHT edge
+    def _circles(self):
+        b = self.bounds()
+        d = CFG.LIGHT_DIAM
+        cy = b.size.height / 2.0
+        cx_close = b.size.width - CFG.EDGE_INSET - d/2.0
+        out = []
+        for i, which in enumerate(("close", "minimize", "zoom")):
+            cx = cx_close - i * CFG.LIGHT_SPACING
+            out.append((which, cx, cy, d/2.0))
+        return out
+
+    def drawRect_(self, rect):
+        for which, cx, cy, r in self._circles():
+            col = {"close": COL_CLOSE, "minimize": COL_MIN,
+                   "zoom": COL_ZOOM}[which]
+            circle = NSBezierPath.bezierPathWithOvalInRect_(
+                NSMakeRect(cx-r, cy-r, 2*r, 2*r))
+            NSColor.colorWithSRGBRed_green_blue_alpha_(*col, 1.0).setFill()
+            circle.fill()
+            NSColor.colorWithSRGBRed_green_blue_alpha_(
+                col[0]*COL_BORDER, col[1]*COL_BORDER,
+                col[2]*COL_BORDER, 1.0).setStroke()
+            circle.setLineWidth_(0.5)
+            circle.stroke()
+            if self.hovered:
+                self._draw_hover_glyph(which, cx, cy, r)
+
+    def _draw_hover_glyph(self, which, cx, cy, r):
+        NSColor.colorWithSRGBRed_green_blue_alpha_(*COL_GLYPH, .95).setStroke()
+        p = NSBezierPath.bezierPath()
+        p.setLineWidth_(1.4)
+        g = r * 0.42
+        if which == "close":                          # ×
+            p.moveToPoint_(NSMakePoint(cx-g, cy-g))
+            p.lineToPoint_(NSMakePoint(cx+g, cy+g))
+            p.moveToPoint_(NSMakePoint(cx-g, cy+g))
+            p.lineToPoint_(NSMakePoint(cx+g, cy-g))
+            p.stroke()
+        elif which == "minimize":                     # −
+            p.moveToPoint_(NSMakePoint(cx-g, cy))
+            p.lineToPoint_(NSMakePoint(cx+g, cy))
+            p.stroke()
+        else:                                         # zoom ◤◢ triangles
+            NSColor.colorWithSRGBRed_green_blue_alpha_(*COL_GLYPH, .95).setFill()
+            t = NSBezierPath.bezierPath()
+            t.moveToPoint_(NSMakePoint(cx-g, cy+g*0.2))
+            t.lineToPoint_(NSMakePoint(cx-g, cy+g))
+            t.lineToPoint_(NSMakePoint(cx-g*0.2, cy+g))
+            t.closePath(); t.fill()
+            t2 = NSBezierPath.bezierPath()
+            t2.moveToPoint_(NSMakePoint(cx+g, cy-g*0.2))
+            t2.lineToPoint_(NSMakePoint(cx+g, cy-g))
+            t2.lineToPoint_(NSMakePoint(cx+g*0.2, cy-g))
+            t2.closePath(); t2.fill()
+
+    def mouseDown_(self, e):
+        pt = self.convertPoint_fromView_(e.locationInWindow(), None)
+        for which, cx, cy, r in self._circles():
+            if math.hypot(pt.x - cx, pt.y - cy) <= r + 3:
+                if self.on_click:
+                    self.on_click(which)
+                return
+
+# ───────────────────────────── OVERLAY PAIR ────────────────────────────────
+def _make_overlay_window(rect):
+    w = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+        rect, NSWindowStyleMaskBorderless, NSBackingStoreBuffered, False)
+    w.setOpaque_(False)
+    w.setBackgroundColor_(NSColor.clearColor())
+    w.setLevel_(NSFloatingWindowLevel)
+    w.setHasShadow_(False)
+    w.setCollectionBehavior_(
+        NSWindowCollectionBehaviorCanJoinAllSpaces |
+        NSWindowCollectionBehaviorFullScreenAuxiliary |
+        NSWindowCollectionBehaviorTransient)
+    w.setTitle_("WITA_OVERLAY")
+    return w
+
+
+class OverlayPair:
+    """One skinned window = mask (left) + lights (right)."""
+    def __init__(self, pid, window_id, engine):
+        self.pid = pid
+        self.window_id = window_id
+        self._engine = engine
+        self.cg_frame = None            # (x, y_top, w, h)
+        self.tb_h = CFG.TITLEBAR_H
+        self._slow_count = 0
+
+        r = NSMakeRect(0, 0, CFG.MASK_W, CFG.TITLEBAR_H)
+        self.mask_win = _make_overlay_window(r)
+        self.mask_view = MaskView.alloc().initWithFrame_(r)
+        self.mask_win.setContentView_(self.mask_view)
+
+        r2 = NSMakeRect(0, 0, CFG.LIGHTS_W, CFG.TITLEBAR_H)
+        self.lights_win = _make_overlay_window(r2)
+        self.lights_view = LightsView.alloc().initWithFrame_(r2)
+        self.lights_view.on_click = self._clicked
+        self.lights_win.setContentView_(self.lights_view)
+        self.lights_win.setIgnoresMouseEvents_(False)
+        self.mask_win.setIgnoresMouseEvents_(False)
+
+    # ── clicks ────────────────────────────────────────────────────────────
+    def _clicked(self, which):
+        if self.cg_frame:
+            self._engine._handling_click = True
+            try:
+                press_traffic_light(self.pid, self.cg_frame, which)
+            finally:
+                self._engine._handling_click = False
+
+    # ── fast tick: reposition only ────────────────────────────────────────
+    def track(self, cg_frame):
+        self.cg_frame = cg_frame
+        x, y, w, h = cg_frame
+        mask_rect = topleft_to_appkit(x, y, CFG.MASK_W, self.tb_h)
+        lights_rect = topleft_to_appkit(
+            x + w - CFG.LIGHTS_W, y, CFG.LIGHTS_W, self.tb_h)
+        self.mask_win.setFrame_display_(mask_rect, False)
+        self.lights_win.setFrame_display_(lights_rect, False)
+        if not self.mask_win.isVisible():
+            self.mask_win.orderFrontRegardless()
+            self.lights_win.orderFrontRegardless()
+
+    # ── slow tick: geometry, colors, live mirror ──────────────────────────
+    def refresh(self):
+        if not self.cg_frame:
+            return
+        _, tb_h = native_lights_geometry(self.pid, self.cg_frame)
+        self.tb_h = tb_h
+        self.mask_view.bg = sample_titlebar_color(
+            self.window_id, self.cg_frame[2])
+        self._slow_count += 1
+        if self._slow_count % CFG.MIRROR_HZ_DIVIDER == 0:
+            self.mask_view.mirror = capture_window_strip(
+                self.window_id, self.cg_frame[2], CFG.MASK_W, self.tb_h)
+        self.mask_view.setNeedsDisplay_(True)
+        self.lights_view.setNeedsDisplay_(True)
+
+    def hide(self):
+        self.mask_win.orderOut_(None)
+        self.lights_win.orderOut_(None)
+
+    def destroy(self):
+        self.hide()
+        self.mask_win.close()
+        self.lights_win.close()
+
+# ───────────────────────────── ENGINE ──────────────────────────────────────
+class Engine(NSObject):
+    def init(self):
+        self = objc.super(Engine, self).init()
+        if self is None:
+            return None
+        self.pairs = {}          # window_id → OverlayPair
+        self._miss_counts = {}   # window_id → consecutive ticks missing
+        self._handling_click = False  # True while a click's AXPress call is
+                                       # in flight. AXUIElementPerformAction
+                                       # can synchronously pump the run loop
+                                       # waiting on the target app, which can
+                                       # let our own NSTimer fire tick_ (a
+                                       # NORMAL, non-reentrant call from
+                                       # tick_'s own perspective) WHILE that
+                                       # click is still being handled. If that
+                                       # tick destroys/creates NSWindow
+                                       # objects at the same moment AppKit is
+                                       # internally processing the click, we
+                                       # get ObjC-bridge corruption even
+                                       # though tick_ never called itself.
+                                       # Skipping ticks during a click closes
+                                       # this second reentrancy path.
+        self._ticking = False    # reentrancy guard — AXUIElementPerformAction
+                                  # can synchronously spin the run loop while
+                                  # waiting on the target app's accessibility
+                                  # server, which can let our own NSTimer
+                                  # (registered on NSRunLoopCommonModes) fire
+                                  # AGAIN before the outer tick_ call returns.
+                                  # A reentrant _tick() mutating self.pairs /
+                                  # destroying NSWindow objects mid-iteration
+                                  # of the outer call is a very plausible
+                                  # cause of the sporadic ObjC-level
+                                  # corruption we were seeing (NSScreen
+                                  # arrays intermittently "becoming" NSWindow
+                                  # objects, etc).
+        self._skip_ids = set()   # window_id → confirmed "not a real app
+                                  # window" (system HUDs/popovers under
+                                  # SKIN_ALL_APPS), so we don't re-probe AX
+        self._slow_accum = 0.0
+        return self
+
+    # ── screen-aware geometry helpers ────────────────────────────────────
+    # Bug fix: the old fullscreen guard always compared a window's bounds
+    # against NSScreen.screens()[0] (the primary display) even when the
+    # window lived on a secondary monitor. On any multi-display rig that
+    # silently mis-detects "fullscreen" and permanently drops the skin for
+    # windows that are merely large/maximized on a non-primary screen.
+    def _screen_for_window(self, b):
+        # Defensive: NSScreen.screens() has been observed, very rarely,
+        # to return a corrupted/wrong-typed array under rapid AppKit
+        # notification churn (window close/Spaces transitions) — almost
+        # certainly a pyobjc/ObjC-bridge race outside our own tick
+        # reentrancy guard. Rather than let one bad read crash the whole
+        # tick (and freeze every overlay until the next tick recovers),
+        # fall back to treating the window as "on the primary screen"
+        # for this one frame and try again normally next tick.
+        try:
+            screens = list(NSScreen.screens())
+        except TypeError:
+            logger.warning("SCREEN: NSScreen.screens() returned a bad "
+                           "value this tick — using primary-screen fallback")
+            return NSScreen.mainScreen() or NSScreen.screens()[0]
+
+        x, y = b.get("X", 0), b.get("Y", 0)
+        w, h = b.get("Width", 0), b.get("Height", 0)
+        prim_h = screens[0].frame().size.height
+        cx = x + w / 2.0
+        cy_bl = prim_h - (y + h / 2.0)   # window center, flipped to AppKit space
+        for scr in screens:
+            f = scr.frame()
+            if (f.origin.x <= cx <= f.origin.x + f.size.width and
+                    f.origin.y <= cy_bl <= f.origin.y + f.size.height):
+                return scr
+        return screens[0]
+
+    def _looks_fullscreen(self, b):
+        scr = self._screen_for_window(b)
+        f = scr.frame()
+        prim_h = NSScreen.screens()[0].frame().size.height
+        scr_x = f.origin.x
+        scr_y_top = prim_h - (f.origin.y + f.size.height)
+        x, y = b.get("X", 0), b.get("Y", 0)
+        w, h = b.get("Width", 0), b.get("Height", 0)
+        return (w >= f.size.width - 2 and h >= f.size.height - 2 and
+                abs(x - scr_x) <= 2 and abs(y - scr_y_top) <= 2)
+
+    def _exclusion_reason(self, wid):
+        """Re-scan and explain why a previously-skinned window just dropped
+        out of eligibility. Only called on an actual teardown event, so it
+        costs nothing in the hot loop but ends the guessing game in the log."""
+        ws = NSWorkspace.sharedWorkspace()
+        front = ws.frontmostApplication()
+        front_pid = front.processIdentifier() if front else -1
+        infos = CGWindowListCopyWindowInfo(
+            kCGWindowListOptionOnScreenOnly |
+            kCGWindowListExcludeDesktopElements, kCGNullWindowID) or []
+        for info in infos:
+            if info.get("kCGWindowNumber") != wid:
+                continue
+            pid = info.get("kCGWindowOwnerPID", -1)
+            if not CFG.SKIN_ALL_APPS and pid != front_pid:
+                return f"app no longer frontmost (pid={pid} front_pid={front_pid})"
+            if info.get("kCGWindowLayer", 1) != 0:
+                return f"layer changed to {info.get('kCGWindowLayer')}"
+            owner = info.get("kCGWindowOwnerName", "")
+            if owner in CFG.IGNORED_APPS:
+                return f"owner now in IGNORED_APPS ({owner})"
+            if info.get("kCGWindowAlpha", 1) <= 0.05:
+                return f"alpha dropped to {info.get('kCGWindowAlpha')}"
+            b = info.get("kCGWindowBounds", {})
+            w, h = b.get("Width", 0), b.get("Height", 0)
+            if w < CFG.MIN_W or h < CFG.MIN_H:
+                return f"too small now w={w} h={h}"
+            if self._looks_fullscreen(b):
+                return f"fullscreen guard tripped (bounds={b})"
+            return "passed all filters this scan — was likely a transient CGWindowList glitch"
+        return "window id vanished from CGWindowList entirely (closed, minimized, or moved to another Space)"
+
+    # entry point ------------------------------------------------------------
+    def start(self):
+        t = NSTimer.timerWithTimeInterval_target_selector_userInfo_repeats_(
+            CFG.FAST_TICK, self, "tick:", None, True)
+        NSRunLoop.currentRunLoop().addTimer_forMode_(t, NSRunLoopCommonModes)
+        logger.info("ENGINE: started · fast=%.0fms slow=%.0fms mirror=%s",
+                    CFG.FAST_TICK*1000, CFG.SLOW_TICK*1000,
+                    CFG.MIRROR_CONTENT)
+
+    # window discovery ---------------------------------------------------------
+    def _eligible_windows(self):
+        """{window_id: (pid, frame)} for windows we should skin."""
+        ws = NSWorkspace.sharedWorkspace()
+        front = ws.frontmostApplication()
+        front_pid = front.processIdentifier() if front else -1
+        own_pid = os.getpid()
+        infos = CGWindowListCopyWindowInfo(
+            kCGWindowListOptionOnScreenOnly |
+            kCGWindowListExcludeDesktopElements, kCGNullWindowID) or []
+
+        by_pid = {}
+        for info in infos:
+            pid = info.get("kCGWindowOwnerPID", -1)
+            if pid == own_pid:
+                continue
+            if not CFG.SKIN_ALL_APPS and pid != front_pid:
+                continue
+            if info.get("kCGWindowLayer", 1) != 0:
+                continue
+            owner = info.get("kCGWindowOwnerName", "")
+            if owner in CFG.IGNORED_APPS:
+                continue
+            if info.get("kCGWindowAlpha", 1) <= 0.05:
+                continue
+            by_pid.setdefault(pid, []).append(info)
+
+        out = {}
+        for pid, surfaces in by_pid.items():
+            # Some apps (Electron apps like Claude Desktop, confirmed by
+            # direct inspection) render their ONE logical window as
+            # MULTIPLE stacked CGWindow surfaces — e.g. a thin real
+            # titlebar strip plus a separate content pane below it, each
+            # individually a different size/position than the actual
+            # outer window. Trusting raw CGWindowList bounds in that case
+            # tracks whichever surface happens to pass our size filters
+            # (usually the big content pane), leaving our mask/fake
+            # lights offset well below the REAL native traffic lights,
+            # which then stay fully exposed no matter how correct the
+            # rest of our geometry math is. The Accessibility API doesn't
+            # have this problem — AXWindows correctly reports ONE frame
+            # for the real logical window even when CGWindowList shows
+            # several internal compositing layers underneath it. Prefer
+            # that when available; fall back to raw CG bounds per-surface
+            # only if AX has nothing for this pid (e.g. permission not
+            # granted, or a genuinely windowless helper process).
+            ax_frame_val = None
+            for ax_win in app_ax_windows(pid):
+                f = ax_frame(ax_win)
+                if f:
+                    ax_frame_val = f
+                    break
+
+            if ax_frame_val is not None:
+                x, y, w, h = ax_frame_val
+                if w < CFG.MIN_W or h < CFG.MIN_H:
+                    continue
+                b = {"X": x, "Y": y, "Width": w, "Height": h}
+                if self._looks_fullscreen(b):
+                    continue
+                # Anchor to whichever raw CGWindow surface for this pid
+                # has the largest on-screen area — gives the mirror
+                # capture / titlebar-color sampling code (which need a
+                # real CGWindow id) something reasonable to read pixels
+                # from, even though the POSITION/SIZE we actually track
+                # and draw from comes from AX.
+                anchor = max(surfaces, key=lambda i: (
+                    i.get("kCGWindowBounds", {}).get("Width", 0) *
+                    i.get("kCGWindowBounds", {}).get("Height", 0)))
+                out[anchor["kCGWindowNumber"]] = (pid, (x, y, w, h))
+                continue
+
+            for info in surfaces:
+                b = info.get("kCGWindowBounds", {})
+                x, y = b.get("X", 0), b.get("Y", 0)
+                w, h = b.get("Width", 0), b.get("Height", 0)
+                if w < CFG.MIN_W or h < CFG.MIN_H:          # v1 guard
+                    continue
+                # fullscreen guard — screen-aware (fixes false
+                # positives/negatives on secondary monitors that don't
+                # match the primary display size)
+                if self._looks_fullscreen(b):
+                    continue
+                out[info["kCGWindowNumber"]] = (pid, (x, y, w, h))
+        return out
+
+    # main loop ---------------------------------------------------------------
+    def tick_(self, timer):
+        if self._ticking or self._handling_click:
+            logger.debug("TICK: skipped (tick or click already in flight)")
+            return
+        self._ticking = True
+        try:
+            with objc.autorelease_pool():
+                self._tick()
+        except Exception:
+            logger.exception("TICK: unhandled")
+        finally:
+            self._ticking = False
+
+    def _tick(self):
+        eligible = self._eligible_windows()
+
+        # retire stale skins — but only after MISS_TOLERANCE consecutive
+        # ticks, not on the first miss. A single dropped frame from
+        # CGWindowListCopyWindowInfo (occlusion transitions, Spaces/Mission
+        # Control animations, a resize mid-drag) used to instantly destroy
+        # and recreate the OverlayPair, which is exactly the flicker /
+        # "reverts to native lights" behavior. Now we ride through brief
+        # gaps and only tear down if the window is genuinely gone.
+        for wid in list(self.pairs):
+            if wid in eligible:
+                self._miss_counts.pop(wid, None)
+                continue
+            misses = self._miss_counts.get(wid, 0) + 1
+            self._miss_counts[wid] = misses
+            if misses == 1:
+                # Hide the instant we lose it — cheap (just orderOut_) and
+                # prevents the ghost-box artifact of a stale mask/lights
+                # window sitting at its last position while we wait out
+                # the tolerance window below.
+                self.pairs[wid].hide()
+            if misses >= CFG.MISS_TOLERANCE:
+                reason = self._exclusion_reason(wid)
+                logger.info("SKIN: -window id=%s after %d missed ticks — %s",
+                            wid, misses, reason)
+                self.pairs.pop(wid).destroy()
+                self._miss_counts.pop(wid, None)
+
+        # create / reposition
+        slow = False
+        self._slow_accum += CFG.FAST_TICK
+        if self._slow_accum >= CFG.SLOW_TICK:
+            self._slow_accum = 0.0
+            slow = True
+
+        for wid, (pid, frame) in eligible.items():
+            pair = self.pairs.get(wid)
+            if pair is None:
+                pair = OverlayPair(pid, wid, self)
+                self.pairs[wid] = pair
+                pair.track(frame)
+                pair.refresh()                # immediate first paint
+                logger.info("SKIN: +window id=%s pid=%s w=%d h=%d",
+                            wid, pid, frame[2], frame[3])
+                continue
+            pair.track(frame)
+            if slow:
+                pair.refresh()
+
+    def shutdown(self):
+        for pair in self.pairs.values():
+            pair.destroy()
+        self.pairs.clear()
+
+# ─────────────────────── PERMISSIONS / LAUNCHD ─────────────────────────────
+def ensure_ax_permission():
+    opts = {"AXTrustedCheckOptionPrompt": True}
+    trusted = AXIsProcessTrustedWithOptions(opts)
+    if not trusted:
+        logger.error("PERM: Accessibility not granted — clicks will fail. "
+                     "System Settings → Privacy & Security → Accessibility")
+    return trusted
+
+PLIST_BODY = """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+ "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.punks.windowsintheapple</string>
+  <key>ProgramArguments</key><array>
+    <string>{python}</string>
+    <string>{script}</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>{log}</string>
+  <key>StandardErrorPath</key><string>{log}</string>
+</dict></plist>
+"""
+
+def install_agent():
+    script = os.path.abspath(__file__)
+    python = sys.executable
+    body = PLIST_BODY.format(python=python, script=script, log=CFG.LOG_PATH)
+    os.makedirs(os.path.dirname(CFG.PLIST), exist_ok=True)
+    with open(CFG.PLIST, "w") as f:
+        f.write(body)
+    subprocess.run(["launchctl", "unload", CFG.PLIST],
+                   capture_output=True)
+    subprocess.run(["launchctl", "load", CFG.PLIST], check=True)
+    print(f"✓ launchd agent installed + loaded: {CFG.PLIST}")
+
+def uninstall_agent():
+    subprocess.run(["launchctl", "unload", CFG.PLIST], capture_output=True)
+    if os.path.exists(CFG.PLIST):
+        os.remove(CFG.PLIST)
+    print("✓ launchd agent unloaded + removed")
+
+# ───────────────────────────── MAIN ────────────────────────────────────────
+def main():
+    if "--install" in sys.argv:
+        install_agent(); return
+    if "--uninstall" in sys.argv:
+        uninstall_agent(); return
+
+    setup_logging("--debug" in sys.argv)
+    logger.info("═" * 60)
+    logger.info("WINDOWSINTHEAPPLE v2.2 · pid=%s · python=%s",
+                os.getpid(), sys.version.split()[0])
+    ensure_ax_permission()
+
+    app = NSApplication.sharedApplication()
+    app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+
+    engine = Engine.alloc().init()
+    engine.start()
+
+    def _bye(sig, frm):
+        logger.info("ENGINE: signal %s — cleaning up", sig)
+        engine.shutdown()
+        os._exit(0)
+    signal.signal(signal.SIGINT, _bye)
+    signal.signal(signal.SIGTERM, _bye)
+
+    app.run()
+
+if __name__ == "__main__":
+    main()

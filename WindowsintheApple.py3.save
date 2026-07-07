@@ -1,0 +1,250 @@
+import objc
+import AppKit
+import Quartz
+import subprocess
+import time
+import sys
+import os
+
+if len(sys.argv) > 1 and sys.argv[1] == "--tap":
+    sys.stderr = open(os.devnull, 'w')
+    _ALWAYS_REMAP = frozenset({1, 3, 9, 13, 15, 16, 17, 35, 45})
+    _NANO_SENSITIVE = frozenset({0, 6, 7, 8})
+    _TERMINAL_APPS = frozenset({"Terminal", "iTerm2", "iTerm", "Hyper", "Alacritty", "Warp"})
+    _nano_cache_time  = 0.0
+    _nano_cache_value = False
+    _NANO_CACHE_TTL   = 0.15
+
+    def _is_nano_active() -> bool:
+        global _nano_cache_time, _nano_cache_value
+        now = time.monotonic()
+        if now - _nano_cache_time < _NANO_CACHE_TTL:
+            return _nano_cache_value
+        _nano_cache_time = now
+        result = False
+        try:
+            active = AppKit.NSWorkspace.sharedWorkspace().frontmostApplication()
+            if active and (active.localizedName() or "") in _TERMINAL_APPS:
+                pid   = active.processIdentifier()
+                wlist = Quartz.CGWindowListCopyWindowInfo(Quartz.kCGWindowListOptionOnScreenOnly, Quartz.kCGNullWindowID)
+                if wlist:
+                    for w in wlist:
+                        if w.get("kCGWindowOwnerPID") != pid: continue
+                        if w.get("kCGWindowLayer", 0) != 0:   continue
+                        title = (w.get("kCGWindowName") or "").strip().lower()
+                        if title == "nano" or title.startswith("nano ") or " nano" in title or title.startswith("sudo nano"):
+                            result = True
+                            break
+        except Exception:
+            pass
+        _nano_cache_value = result
+        return result
+
+    class _KeyEngine:
+        def __init__(self):
+            self.last_key_time  = 0.0
+            self.palm_threshold = 0.2
+        def event_callback(self, proxy, event_type, event, refcon):
+            try:
+                now = time.monotonic()
+                if event_type in (Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp):
+                    if (now - self.last_key_time) < self.palm_threshold:
+                        return None
+                    return event
+                if event_type != Quartz.kCGEventKeyDown:
+                    return event
+                self.last_key_time = now
+                flags   = Quartz.CGEventGetFlags(event)
+                keycode = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGKeyboardEventKeycode)
+                ctrl_only = (flags & Quartz.kCGEventFlagMaskControl) and not (flags & Quartz.kCGEventFlagMaskCommand) and not (flags & Quartz.kCGEventFlagMaskAlternate)
+                if not ctrl_only:
+                    return event
+                if keycode in _ALWAYS_REMAP:
+                    flags &= ~Quartz.kCGEventFlagMaskControl
+                    flags |=  Quartz.kCGEventFlagMaskCommand
+                    Quartz.CGEventSetFlags(event, flags)
+                    return event
+                if keycode in _NANO_SENSITIVE:
+                    if not _is_nano_active():
+                        flags &= ~Quartz.kCGEventFlagMaskControl
+                        flags |=  Quartz.kCGEventFlagMaskCommand
+                        Quartz.CGEventSetFlags(event, flags)
+            except Exception:
+                pass
+            return event
+
+    _engine = _KeyEngine()
+    _mask   = (Quartz.CGEventMaskBit(Quartz.kCGEventKeyDown) | Quartz.CGEventMaskBit(Quartz.kCGEventLeftMouseDown) | Quartz.CGEventMaskBit(Quartz.kCGEventLeftMouseUp))
+    _tap = Quartz.CGEventTapCreate(Quartz.kCGSessionEventTap, Quartz.kCGHeadInsertEventTap, 0, _mask, _engine.event_callback, None)
+    if _tap:
+        _src = Quartz.CFMachPortCreateRunLoopSource(None, _tap, 0)
+        Quartz.CFRunLoopAddSource(Quartz.CFRunLoopGetCurrent(), _src, Quartz.kCFRunLoopCommonModes)
+        Quartz.CGEventTapEnable(_tap, True)
+        Quartz.CFRunLoopRun()
+    sys.exit(0)
+
+sys.stderr = open(os.devnull, 'w')
+_RED    = "ff5f57"
+_YELLOW = "ffbd2e"
+_GREEN  = "28c940"
+_SKIP_APPS = frozenset({"Window Server", "Dock", "loginwindow", "ControlCenter", "SystemUIServer", "Notification Center", "Spotlight"})
+_CHROME_NAMES = ("Chrome", "Gemini", "Google")
+_APP_PROFILES = {
+    "Terminal":         ("1d1d1d", 14, 15, 14, 20),
+    "Console":          ("1d1d1d", 14, 15, 14, 20),
+    "Finder":           ("282828", 14, 15, 14, 20),
+    "System Settings":  ("1e1e1e", 14, 15, 14, 20),
+    "App Store":        ("1c1c1e", 14, 15, 14, 20),
+    "_default":         ("1e1e1e", 14, 15, 14, 20),
+}
+
+def _get_profile(app_name: str) -> tuple:
+    for key, profile in _APP_PROFILES.items():
+        if key != "_default" and key in app_name:
+            return profile
+    return _APP_PROFILES["_default"]
+
+_R_OFFSET  = 90
+_R_SPACING = 22
+_R_DIAM    = 13
+_R_Y_OFF   = 15
+
+def _nscolor(hex6: str) -> AppKit.NSColor:
+    h = hex6.strip().lstrip('#')
+    return AppKit.NSColor.colorWithRed_green_blue_alpha_(int(h[0:2], 16) / 255.0, int(h[2:4], 16) / 255.0, int(h[4:6], 16) / 255.0, 1.0)
+
+def _set(hex6: str):
+    _nscolor(hex6).set()
+
+def _rect(x, y, w, h):
+    AppKit.NSRectFill(AppKit.NSMakeRect(x, y, w, h))
+
+def _oval(x, y, d):
+    AppKit.NSBezierPath.bezierPathWithOvalInRect_(AppKit.NSMakeRect(x, y, d, d)).fill()
+
+def _pill(x, y, w, h, r):
+    AppKit.NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(AppKit.NSMakeRect(x, y, w, h), r, r).fill()
+
+class GhostPanel(AppKit.NSPanel):
+    def canBecomeKeyWindow(self):      return False
+    def canBecomeMainWindow(self):     return False
+    def acceptsMouseMovedEvents(self): return False
+
+class OverlayView(AppKit.NSView):
+    def isFlipped(self):              return True
+    def acceptsFirstResponder(self):  return False
+    def mouseDownCanMoveWindow(self): return False
+
+    @staticmethod
+    def find_main_window(pid: int):
+        wlist = Quartz.CGWindowListCopyWindowInfo(Quartz.kCGWindowListOptionOnScreenOnly, Quartz.kCGNullWindowID)
+        if not wlist:
+            return None
+        best = None
+        max_area = 0
+        for w in wlist:
+            if w.get("kCGWindowLayer", 0) != 0:        continue
+            if w.get("kCGWindowOwnerPID") != pid:       continue
+            if w.get("kCGWindowAlpha", 1.0) == 0.0:    continue
+            b = w.get("kCGWindowBounds")
+            if not b:                                   continue
+            if b['Width'] < 250 or b['Height'] < 150:  continue
+            area = b['Width'] * b['Height']
+            if area > max_area:
+                max_area = area
+                best     = w
+        return best
+
+    def drawRect_(self, _dirty):
+        AppKit.NSColor.clearColor().set()
+        AppKit.NSRectFill(self.bounds())
+        active_app = AppKit.NSWorkspace.sharedWorkspace().frontmostApplication()
+        if not active_app:
+            return
+        active_name = active_app.localizedName() or ""
+        if active_name in _SKIP_APPS:
+            return
+        main_w = OverlayView.find_main_window(active_app.processIdentifier())
+        if not main_w:
+            return
+        b = main_w.get("kCGWindowBounds")
+        x, y, w = b['X'], b['Y'], b['Width']
+        if any(n in active_name for n in _CHROME_NAMES):
+            self._draw_chrome(x, y, w)
+        else:
+            self._draw_standard(x, y, w, active_name)
+
+    def _draw_chrome(self, x, y, w):
+        BG      = "202124"
+        _set(BG)
+        _oval(x + 14, y + 15, 14)
+        _oval(x + 34, y + 15, 14)
+        _oval(x + 54, y + 15, 14)
+        dot_y = y + 15
+        _set(_YELLOW); _oval(x + w - 85, dot_y, 13)
+        _set(_GREEN);  _oval(x + w - 63, dot_y, 13)
+        _set(_RED);    _oval(x + w - 41, dot_y, 13)
+
+    def _draw_standard(self, x, y, w, app_name):
+        bg, diam, y_off, x0, spacing = _get_profile(app_name)
+        mask_d = diam + 2
+        _set(bg)
+        _oval(x + x0,             y + y_off, mask_d)
+        _oval(x + x0 + spacing,   y + y_off, mask_d)
+        _oval(x + x0 + spacing*2, y + y_off, mask_d)
+        rx = x + w - _R_OFFSET
+        ry = y + _R_Y_OFF
+        _set(_YELLOW); _oval(rx,              ry, _R_DIAM)
+        _set(_GREEN);  _oval(rx + _R_SPACING, ry, _R_DIAM)
+        _set(_RED);    _oval(rx + _R_SPACING*2, ry, _R_DIAM)
+
+class AppDelegate(AppKit.NSObject):
+    def applicationDidFinishLaunching_(self, notification):
+        frame = AppKit.NSScreen.mainScreen().frame()
+        self._window = GhostPanel.alloc().initWithContentRect_styleMask_backing_defer_(frame, 128, AppKit.NSBackingStoreBuffered, False)
+        self._window.setLevel_(Quartz.kCGMaximumWindowLevel - 1)
+        self._window.setHasShadow_(False)
+        self._window.setOpaque_(False)
+        self._window.setBackgroundColor_(AppKit.NSColor.clearColor())
+        self._window.setIgnoresMouseEvents_(True)
+        self._window.setCollectionBehavior_(1 | 16 | 64)
+        self._window.setFloatingPanel_(True)
+        self._window.setBecomesKeyOnlyIfNeeded_(True)
+        self._view = OverlayView.alloc().initWithFrame_(frame)
+        self._window.setContentView_(self._view)
+        self._window.orderFrontRegardless()
+        self._last_state = ""
+        self._timer = AppKit.NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(0.15, self, objc.selector(self._tick_, signature=b'v@:@'), None, True)
+
+    def _tick_(self, _timer):
+        try:
+            active_app = AppKit.NSWorkspace.sharedWorkspace().frontmostApplication()
+            if not active_app:
+                return
+            active_name = active_app.localizedName() or ""
+            if active_name in _SKIP_APPS:
+                if self._last_state:
+                    self._last_state = ""
+                    self._view.setNeedsDisplay_(True)
+                return
+            pid    = active_app.processIdentifier()
+            main_w = OverlayView.find_main_window(pid)
+            if main_w:
+                b     = main_w.get("kCGWindowBounds")
+                state = (f"{pid}_{b['X']:.0f}_{b['Y']:.0f}_{b['Width']:.0f}_{b['Height']:.0f}")
+                if state != self._last_state:
+                    self._last_state = state
+                    self._view.setNeedsDisplay_(True)
+            else:
+                if self._last_state:
+                    self._last_state = ""
+                    self._view.setNeedsDisplay_(True)
+        except Exception:
+            pass
+
+if __name__ == "__main__":
+    app = AppKit.NSApplication.sharedApplication()
+    app.setActivationPolicy_(AppKit.NSApplicationActivationPolicyAccessory)
+    delegate = AppDelegate.alloc().init()
+    app.setDelegate_(delegate)
+    AppKit.NSApp().run()
